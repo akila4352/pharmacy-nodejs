@@ -23,7 +23,7 @@ mongoose.connect(MONGODB_URI, {
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'your_default_secret';
 
-// User Schema & Model
+// Updated User Schema
 const userSchema = new mongoose.Schema({
     firstName: String,
     lastName: String,
@@ -37,16 +37,30 @@ const userSchema = new mongoose.Schema({
         type: String,
         required: true
     },
+    role: {
+        type: String,
+        enum: ['patient', 'pharmacy', 'admin'],
+        default: 'patient'
+    },
+    // Pharmacy specific fields
+    pharmacyDetails: {
+        pharmacyName: String,
+        address: String,
+        medicineName: String,
+        price: Number,
+        latitude: String,
+        longitude: String,
+        isAvailable: {
+            type: Boolean,
+            default: true
+        }
+    },
     createdAt: {
         type: Date,
         default: Date.now
-    },
-    isAdmin: {
-        type: Boolean,
-        default: false
-    },
-    resetOtp: String
+    }
 });
+
 
 // Hash password before saving
 userSchema.pre('save', async function(next) {
@@ -67,44 +81,124 @@ userSchema.methods.comparePassword = async function(candidatePassword) {
 
 const User = mongoose.model('User', userSchema);
 
-// Register User
+// Updated Register endpoint
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { firstName, lastName, username, email, password } = req.body;
+        const { 
+            firstName, 
+            lastName, 
+            username, 
+            email, 
+            password, 
+            role,
+            adminCode,
+            pharmacyName,
+            address,
+            medicineName,
+            price,
+            latitude,
+            longitude,
+            isAvailable
+        } = req.body;
 
         // Check if user exists
         if (await User.findOne({ email })) {
             return res.status(400).json({ message: 'User already exists' });
         }
 
-        const newUser = new User({ firstName, lastName, username, email, password });
-        await newUser.save();
+        // Validate admin registration
+        if (role === 'admin' && adminCode !== '1234') {
+            return res.status(400).json({ message: 'Invalid admin code' });
+        }
 
+        // Validate pharmacy registration
+        if (role === 'pharmacy') {
+            if (!pharmacyName || !address || !medicineName || !price || !latitude || !longitude) {
+                return res.status(400).json({ 
+                    message: 'All pharmacy fields are required' 
+                });
+            }
+        }
+
+        // Create new user with role-specific data
+        const newUser = new User({
+            firstName,
+            lastName,
+            username,
+            email,
+            password,
+            role,
+            ...(role === 'pharmacy' && {
+                pharmacyDetails: {
+                    pharmacyName,
+                    address,
+                    medicineName,
+                    price,
+                    latitude,
+                    longitude,
+                    isAvailable
+                }
+            })
+        });
+
+        await newUser.save();
         res.status(201).json({ message: 'User registered successfully' });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
 
-// Login User
+
+// Updated Login User with role verification
 app.post('/api/auth/login', async (req, res) => {
     try {
-        const { email, password } = req.body;
+        const { email, password, role } = req.body;
         const user = await User.findOne({ email });
 
-        if (!user) return res.status(404).json({ message: 'User not found' });
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
 
+        // First verify the password
         const isMatch = await user.comparePassword(password);
-        if (!isMatch) return res.status(401).json({ message: 'Invalid credentials' });
+        if (!isMatch) {
+            return res.status(401).json({ message: 'Invalid credentials' });
+        }
 
-        // Generate JWT token
-        const token = jwt.sign({ id: user._id, email: user.email, isAdmin: user.isAdmin }, JWT_SECRET, { expiresIn: '1h' });
+        // Then verify the role
+        if (user.role !== role) {
+            return res.status(401).json({ 
+                message: 'Invalid role selected. Please select the correct role for your account.' 
+            });
+        }
 
-        res.json({ message: 'Login successful', token, user: { id: user._id, email: user.email, isAdmin: user.isAdmin } });
+        // If both password and role are correct, generate token
+        const token = jwt.sign(
+            { 
+                id: user._id, 
+                email: user.email, 
+                role: user.role 
+            }, 
+            JWT_SECRET, 
+            { expiresIn: '1h' }
+        );
+
+        res.json({ 
+            message: 'Login successful', 
+            token, 
+            user: { 
+                id: user._id, 
+                email: user.email, 
+                role: user.role,
+                firstName: user.firstName,
+                lastName: user.lastName
+            } 
+        });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
+
 
 // Start Server
 const PORT = process.env.PORT || 5000;
