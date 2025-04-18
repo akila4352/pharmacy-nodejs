@@ -23,7 +23,7 @@ mongoose.connect(MONGODB_URI, {
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'your_default_secret';
 
-// Updated User Schema
+// User Schema
 const userSchema = new mongoose.Schema({
     firstName: String,
     lastName: String,
@@ -42,7 +42,6 @@ const userSchema = new mongoose.Schema({
         enum: ['patient', 'pharmacy', 'admin'],
         default: 'patient'
     },
-    // Pharmacy specific fields
     pharmacyDetails: {
         pharmacyName: String,
         address: String,
@@ -61,66 +60,59 @@ const userSchema = new mongoose.Schema({
     }
 });
 
-
-// Hash password before saving
+// Password hash
 userSchema.pre('save', async function(next) {
     if (!this.isModified('password')) return next();
-    try {
-        const salt = await bcrypt.genSalt(10);
-        this.password = await bcrypt.hash(this.password, salt);
-        next();
-    } catch (err) {
-        next(err);
-    }
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+    next();
 });
 
-// Compare passwords
-userSchema.methods.comparePassword = async function(candidatePassword) {
+// Compare password method
+userSchema.methods.comparePassword = function(candidatePassword) {
     return bcrypt.compare(candidatePassword, this.password);
 };
 
 const User = mongoose.model('User', userSchema);
 
-// Updated Register endpoint
+// Pharmacy Schema
+const pharmacySchema = new mongoose.Schema({
+    name: String,
+    address: String,
+    medicineName: String,
+    price: Number,
+    isAvailable: { type: Boolean, default: true },
+    location: {
+        type: { type: String, default: 'Point' },
+        coordinates: [Number]
+    }
+});
+pharmacySchema.index({ location: '2dsphere' });
+const Pharmacy = mongoose.model('Pharmacy', pharmacySchema);
+
+// Register Endpoint
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { 
-            firstName, 
-            lastName, 
-            username, 
-            email, 
-            password, 
-            role,
-            adminCode,
-            pharmacyName,
-            address,
-            medicineName,
-            price,
-            latitude,
-            longitude,
-            isAvailable
+        const {
+            firstName, lastName, username, email, password, role,
+            adminCode, pharmacyName, address, medicineName,
+            price, latitude, longitude, isAvailable
         } = req.body;
 
-        // Check if user exists
         if (await User.findOne({ email })) {
             return res.status(400).json({ message: 'User already exists' });
         }
 
-        // Validate admin registration
         if (role === 'admin' && adminCode !== '1234') {
             return res.status(400).json({ message: 'Invalid admin code' });
         }
 
-        // Validate pharmacy registration
         if (role === 'pharmacy') {
             if (!pharmacyName || !address || !medicineName || !price || !latitude || !longitude) {
-                return res.status(400).json({ 
-                    message: 'All pharmacy fields are required' 
-                });
+                return res.status(400).json({ message: 'All pharmacy fields are required' });
             }
         }
 
-        // Create new user with role-specific data
         const newUser = new User({
             firstName,
             lastName,
@@ -148,58 +140,125 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
-
-// Updated Login User with role verification
+// Login Endpoint
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { email, password, role } = req.body;
         const user = await User.findOne({ email });
 
-        if (!user) {
-            return res.status(404).json({ message: 'User not found' });
-        }
+        if (!user) return res.status(404).json({ message: 'User not found' });
 
-        // First verify the password
         const isMatch = await user.comparePassword(password);
-        if (!isMatch) {
-            return res.status(401).json({ message: 'Invalid credentials' });
-        }
+        if (!isMatch) return res.status(401).json({ message: 'Invalid credentials' });
 
-        // Then verify the role
         if (user.role !== role) {
-            return res.status(401).json({ 
-                message: 'Invalid role selected. Please select the correct role for your account.' 
+            return res.status(401).json({
+                message: 'Invalid role selected. Please select the correct role for your account.'
             });
         }
 
-        // If both password and role are correct, generate token
         const token = jwt.sign(
-            { 
-                id: user._id, 
-                email: user.email, 
-                role: user.role 
-            }, 
-            JWT_SECRET, 
+            { id: user._id, email: user.email, role: user.role },
+            JWT_SECRET,
             { expiresIn: '1h' }
         );
 
-        res.json({ 
-            message: 'Login successful', 
-            token, 
-            user: { 
-                id: user._id, 
-                email: user.email, 
+        res.json({
+            message: 'Login successful',
+            token,
+            user: {
+                id: user._id,
+                email: user.email,
                 role: user.role,
                 firstName: user.firstName,
                 lastName: user.lastName
-            } 
+            }
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
 
+// Add Pharmacy Endpoint (Corrected)
+app.post('/api/pharmacies', async (req, res) => {
+    try {
+        const { name, address, medicineName, price, isAvailable, location } = req.body;
+        
+        // Validate that location contains valid coordinates
+        if (!location || !location.coordinates || location.coordinates.length !== 2 ||
+            isNaN(parseFloat(location.coordinates[0])) || isNaN(parseFloat(location.coordinates[1]))) {
+            return res.status(400).json({ error: 'Invalid location coordinates' });
+        }
+        
+        // Create new pharmacy
+        const pharmacy = new Pharmacy({
+            name,
+            address,
+            medicineName,
+            price: parseFloat(price),
+            isAvailable: Boolean(isAvailable),
+            location: {
+                type: 'Point',
+                coordinates: [
+                    parseFloat(location.coordinates[0]), 
+                    parseFloat(location.coordinates[1])
+                ]
+            }
+        });
+        
+        await pharmacy.save();
+        res.status(201).json(pharmacy);
+    } catch (err) {
+        console.error('Error creating pharmacy:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
 
-// Start Server
+// Search Nearby Pharmacies
+app.get('/api/pharmacies/search', async (req, res) => {
+    try {
+        const { latitude, longitude, medicineName } = req.query;
+
+        const pharmacies = await Pharmacy.find({
+            location: {
+                $nearSphere: {
+                    $geometry: {
+                        type: 'Point',
+                        coordinates: [parseFloat(longitude), parseFloat(latitude)]
+                    },
+                    $maxDistance: 10000 // 10km
+                }
+            },
+            isAvailable: true,
+            medicineName: new RegExp(medicineName, 'i')
+        });
+
+        res.json(pharmacies);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Update Pharmacy
+app.put('/api/pharmacies/:id', async (req, res) => {
+    try {
+        const updated = await Pharmacy.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        res.json(updated || { message: 'Not found' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Delete Pharmacy
+app.delete('/api/pharmacies/:id', async (req, res) => {
+    try {
+        const deleted = await Pharmacy.findByIdAndDelete(req.params.id);
+        res.json(deleted ? { message: 'Deleted' } : { message: 'Not found' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Server Start
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
