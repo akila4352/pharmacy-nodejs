@@ -1,15 +1,17 @@
-require('dotenv').config();
+// server.js
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+require('dotenv').config();
 
 const app = express();
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // MongoDB Connection
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://akilanirmal2020:d1QbcRXU2aS10Dqe@cluster0.rm7l3.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
@@ -20,245 +22,216 @@ mongoose.connect(MONGODB_URI, {
 .then(() => console.log('✅ Connected to MongoDB'))
 .catch(err => console.error('❌ MongoDB Connection Error:', err));
 
-// JWT Secret
-const JWT_SECRET = process.env.JWT_SECRET || 'your_default_secret';
 
 // User Schema
 const userSchema = new mongoose.Schema({
-    firstName: String,
-    lastName: String,
-    username: String,
-    email: {
-        type: String,
-        required: true,
-        unique: true
-    },
-    password: {
-        type: String,
-        required: true
-    },
-    role: {
-        type: String,
-        enum: ['patient', 'pharmacy', 'admin'],
-        default: 'patient'
-    },
-    pharmacyDetails: {
-        pharmacyName: String,
-        address: String,
-        medicineName: String,
-        price: Number,
-        latitude: String,
-        longitude: String,
-        isAvailable: {
-            type: Boolean,
-            default: true
-        }
-    },
-    createdAt: {
-        type: Date,
-        default: Date.now
-    }
+  firstName: String,
+  lastName: String,
+  username: { type: String, unique: true },
+  email: { type: String, unique: true },
+  password: String,
+  role: { type: String, enum: ['patient', 'pharmacy', 'admin'] },
+  pharmacyName: String,
+  address: String,
+  latitude: String,
+  longitude: String,
+  isActive: { type: Boolean, default: true }
 });
 
-// Password hash
-userSchema.pre('save', async function(next) {
-    if (!this.isModified('password')) return next();
-    const salt = await bcrypt.genSalt(10);
-    this.password = await bcrypt.hash(this.password, salt);
-    next();
+// Medicine Schema
+const medicineSchema = new mongoose.Schema({
+  name: { type: String, required: true },
+  dosage: { type: String, required: true },
+  price: { type: Number, required: true },
+  quantity: { type: Number, required: true },
+  description: String,
+  category: String,
+  expiryDate: Date,
+  isAvailable: { type: Boolean, default: true },
+  pharmacyId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now }
 });
-
-// Compare password method
-userSchema.methods.comparePassword = function(candidatePassword) {
-    return bcrypt.compare(candidatePassword, this.password);
-};
 
 const User = mongoose.model('User', userSchema);
+const Medicine = mongoose.model('Medicine', medicineSchema);
 
-// Pharmacy Schema
-const pharmacySchema = new mongoose.Schema({
-    name: String,
-    address: String,
-    medicineName: String,
-    price: Number,
-    isAvailable: { type: Boolean, default: true },
-    location: {
-        type: { type: String, default: 'Point' },
-        coordinates: [Number]
+// Pharmacy middleware with token parsing inside
+const pharmacyMiddleware = async (req, res, next) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ message: 'No token provided' });
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const user = await User.findById(decoded._id);
+    if (!user || user.role !== 'pharmacy') {
+      return res.status(403).json({ message: 'Access denied. Pharmacy owners only.' });
     }
-});
-pharmacySchema.index({ location: '2dsphere' });
-const Pharmacy = mongoose.model('Pharmacy', pharmacySchema);
 
-// Register Endpoint
+    req.user = user;
+    next();
+  } catch (err) {
+    res.status(401).json({ message: 'Invalid or expired token' });
+  }
+};
+
+// Auth routes
 app.post('/api/auth/register', async (req, res) => {
-    try {
-        const {
-            firstName, lastName, username, email, password, role,
-            adminCode, pharmacyName, address, medicineName,
-            price, latitude, longitude, isAvailable
-        } = req.body;
+  try {
+    const { email, username, password, role } = req.body;
 
-        if (await User.findOne({ email })) {
-            return res.status(400).json({ message: 'User already exists' });
-        }
-
-        if (role === 'admin' && adminCode !== '1234') {
-            return res.status(400).json({ message: 'Invalid admin code' });
-        }
-
-        if (role === 'pharmacy') {
-            if (!pharmacyName || !address || !medicineName || !price || !latitude || !longitude) {
-                return res.status(400).json({ message: 'All pharmacy fields are required' });
-            }
-        }
-
-        const newUser = new User({
-            firstName,
-            lastName,
-            username,
-            email,
-            password,
-            role,
-            ...(role === 'pharmacy' && {
-                pharmacyDetails: {
-                    pharmacyName,
-                    address,
-                    medicineName,
-                    price,
-                    latitude,
-                    longitude,
-                    isAvailable
-                }
-            })
-        });
-
-        await newUser.save();
-        res.status(201).json({ message: 'User registered successfully' });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+    const existingUser = await User.findOne({ $or: [{ email }, { username }] });
+    if (existingUser) {
+      return res.status(400).json({ message: 'User already exists' });
     }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const newUser = new User({
+      ...req.body,
+      password: hashedPassword
+    });
+
+    await newUser.save();
+    res.status(201).json({ message: 'User registered successfully' });
+  } catch (err) {
+    res.status(500).json({ message: 'Error registering user', error: err.message });
+  }
 });
 
-// Login Endpoint
 app.post('/api/auth/login', async (req, res) => {
-    try {
-        const { email, password, role } = req.body;
-        const user = await User.findOne({ email });
+  try {
+    const { email, password, role } = req.body;
 
-        if (!user) return res.status(404).json({ message: 'User not found' });
-
-        const isMatch = await user.comparePassword(password);
-        if (!isMatch) return res.status(401).json({ message: 'Invalid credentials' });
-
-        if (user.role !== role) {
-            return res.status(401).json({
-                message: 'Invalid role selected. Please select the correct role for your account.'
-            });
-        }
-
-        const token = jwt.sign(
-            { id: user._id, email: user.email, role: user.role },
-            JWT_SECRET,
-            { expiresIn: '1h' }
-        );
-
-        res.json({
-            message: 'Login successful',
-            token,
-            user: {
-                id: user._id,
-                email: user.email,
-                role: user.role,
-                firstName: user.firstName,
-                lastName: user.lastName
-            }
-        });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+    const user = await User.findOne({ email, role });
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid credentials' });
     }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign(
+      { _id: user._id, role: user.role },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '24h' }
+    );
+
+    res.json({ token, user: { id: user._id, role: user.role, email: user.email } });
+  } catch (err) {
+    res.status(500).json({ message: 'Error logging in', error: err.message });
+  }
 });
 
-// Add Pharmacy Endpoint (Corrected)
-app.post('/api/pharmacies', async (req, res) => {
-    try {
-        const { name, address, medicineName, price, isAvailable, location } = req.body;
-        
-        // Validate that location contains valid coordinates
-        if (!location || !location.coordinates || location.coordinates.length !== 2 ||
-            isNaN(parseFloat(location.coordinates[0])) || isNaN(parseFloat(location.coordinates[1]))) {
-            return res.status(400).json({ error: 'Invalid location coordinates' });
-        }
-        
-        // Create new pharmacy
-        const pharmacy = new Pharmacy({
-            name,
-            address,
-            medicineName,
-            price: parseFloat(price),
-            isAvailable: Boolean(isAvailable),
-            location: {
-                type: 'Point',
-                coordinates: [
-                    parseFloat(location.coordinates[0]), 
-                    parseFloat(location.coordinates[1])
-                ]
-            }
-        });
-        
-        await pharmacy.save();
-        res.status(201).json(pharmacy);
-    } catch (err) {
-        console.error('Error creating pharmacy:', err);
-        res.status(500).json({ error: err.message });
-    }
+// Medicine routes
+app.get('/api/medicines', pharmacyMiddleware, async (req, res) => {
+  try {
+    const medicines = await Medicine.find({ pharmacyId: req.user._id });
+    res.json(medicines);
+  } catch (err) {
+    res.status(500).json({ message: 'Error fetching medicines', error: err.message });
+  }
 });
 
-// Search Nearby Pharmacies
-app.get('/api/pharmacies/search', async (req, res) => {
-    try {
-        const { latitude, longitude, medicineName } = req.query;
-
-        const pharmacies = await Pharmacy.find({
-            location: {
-                $nearSphere: {
-                    $geometry: {
-                        type: 'Point',
-                        coordinates: [parseFloat(longitude), parseFloat(latitude)]
-                    },
-                    $maxDistance: 10000 // 10km
-                }
-            },
-            isAvailable: true,
-            medicineName: new RegExp(medicineName, 'i')
-        });
-
-        res.json(pharmacies);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
+app.post('/api/medicines', pharmacyMiddleware, async (req, res) => {
+  try {
+    const medicine = new Medicine({
+      ...req.body,
+      pharmacyId: req.user._id
+    });
+    await medicine.save();
+    res.status(201).json(medicine);
+  } catch (err) {
+    res.status(500).json({ message: 'Error adding medicine', error: err.message });
+  }
 });
 
-// Update Pharmacy
-app.put('/api/pharmacies/:id', async (req, res) => {
-    try {
-        const updated = await Pharmacy.findByIdAndUpdate(req.params.id, req.body, { new: true });
-        res.json(updated || { message: 'Not found' });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+app.put('/api/medicines/:id', pharmacyMiddleware, async (req, res) => {
+  try {
+    const medicine = await Medicine.findOneAndUpdate(
+      { _id: req.params.id, pharmacyId: req.user._id },
+      { ...req.body, updatedAt: Date.now() },
+      { new: true }
+    );
+
+    if (!medicine) {
+      return res.status(404).json({ message: 'Medicine not found' });
     }
+
+    res.json(medicine);
+  } catch (err) {
+    res.status(500).json({ message: 'Error updating medicine', error: err.message });
+  }
 });
 
-// Delete Pharmacy
-app.delete('/api/pharmacies/:id', async (req, res) => {
-    try {
-        const deleted = await Pharmacy.findByIdAndDelete(req.params.id);
-        res.json(deleted ? { message: 'Deleted' } : { message: 'Not found' });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+app.delete('/api/medicines/:id', pharmacyMiddleware, async (req, res) => {
+  try {
+    const medicine = await Medicine.findOneAndDelete({
+      _id: req.params.id,
+      pharmacyId: req.user._id
+    });
+
+    if (!medicine) {
+      return res.status(404).json({ message: 'Medicine not found' });
     }
+
+    res.json({ message: 'Medicine deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ message: 'Error deleting medicine', error: err.message });
+  }
 });
 
-// Server Start
+app.post('/api/medicines/bulk', pharmacyMiddleware, async (req, res) => {
+  try {
+    const medicines = req.body.map(medicine => ({
+      ...medicine,
+      pharmacyId: req.user._id
+    }));
+
+    const result = await Medicine.insertMany(medicines);
+    res.status(201).json({
+      message: 'Bulk import successful',
+      count: result.length
+    });
+  } catch (err) {
+    res.status(500).json({ message: 'Error in bulk import', error: err.message });
+  }
+});
+
+// Public routes
+app.get('/api/medicines/pharmacy/:pharmacyId', async (req, res) => {
+  try {
+    const medicines = await Medicine.find({
+      pharmacyId: req.params.pharmacyId,
+      isAvailable: true
+    });
+    res.json(medicines);
+  } catch (err) {
+    res.status(500).json({ message: 'Error fetching medicines', error: err.message });
+  }
+});
+
+app.get('/api/medicines/search', async (req, res) => {
+  try {
+    const { query } = req.query;
+    const medicines = await Medicine.find({
+      $or: [
+        { name: { $regex: query, $options: 'i' } },
+        { category: { $regex: query, $options: 'i' } },
+        { description: { $regex: query, $options: 'i' } }
+      ],
+      isAvailable: true
+    }).populate('pharmacyId', 'pharmacyName address latitude longitude');
+
+    res.json(medicines);
+  } catch (err) {
+    res.status(500).json({ message: 'Error searching medicines', error: err.message });
+  }
+});
+
+// Start server
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
