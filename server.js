@@ -89,7 +89,226 @@ const pharmacySchema = new mongoose.Schema({
 });
 pharmacySchema.index({ location: '2dsphere' });
 const Pharmacy = mongoose.model('Pharmacy', pharmacySchema);
+// Get All Pharmacy Users
+app.get('/api/pharmacy-users', async (req, res) => {
+  try {
+    const pharmacyUsers = await User.find({ role: 'pharmacy' });
+    
+    // Format pharmacy details for dashboard
+    const formattedPharmacies = pharmacyUsers.map(user => {
+      if (!user.pharmacyDetails) return null;
+      
+      return {
+        _id: user._id,
+        name: user.pharmacyDetails.pharmacyName,
+        address: user.pharmacyDetails.address,
+        medicineName: user.pharmacyDetails.medicineName,
+        price: user.pharmacyDetails.price,
+        isAvailable: user.pharmacyDetails.isAvailable,
+        location: {
+          type: 'Point',
+          coordinates: [
+            parseFloat(user.pharmacyDetails.longitude),
+            parseFloat(user.pharmacyDetails.latitude)
+          ]
+        },
+        userEmail: user.email
+      };
+    }).filter(pharmacy => pharmacy !== null);
+    
+    res.json(formattedPharmacies);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
+// Get Pharmacy User by ID
+app.get('/api/pharmacy-users/:id', async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user || user.role !== 'pharmacy') {
+      return res.status(404).json({ message: 'Pharmacy not found' });
+    }
+    
+    const pharmacy = {
+      _id: user._id,
+      name: user.pharmacyDetails.pharmacyName,
+      address: user.pharmacyDetails.address,
+      medicineName: user.pharmacyDetails.medicineName,
+      price: user.pharmacyDetails.price,
+      isAvailable: user.pharmacyDetails.isAvailable,
+      location: {
+        type: 'Point',
+        coordinates: [
+          parseFloat(user.pharmacyDetails.longitude),
+          parseFloat(user.pharmacyDetails.latitude)
+        ]
+      },
+      userEmail: user.email
+    };
+    
+    res.json(pharmacy);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update Pharmacy User Details
+app.put('/api/pharmacy-users/:id', async (req, res) => {
+  try {
+    const { name, address, medicineName, price, isAvailable, location } = req.body;
+    
+    const user = await User.findById(req.params.id);
+    if (!user || user.role !== 'pharmacy') {
+      return res.status(404).json({ message: 'Pharmacy not found' });
+    }
+    
+    // Update pharmacy details
+    user.pharmacyDetails = {
+      pharmacyName: name,
+      address,
+      medicineName,
+      price: parseFloat(price),
+      isAvailable: Boolean(isAvailable),
+      latitude: location.coordinates[1].toString(),
+      longitude: location.coordinates[0].toString()
+    };
+    
+    await user.save();
+    
+    // Format response
+    const updatedPharmacy = {
+      _id: user._id,
+      name: user.pharmacyDetails.pharmacyName,
+      address: user.pharmacyDetails.address,
+      medicineName: user.pharmacyDetails.medicineName,
+      price: user.pharmacyDetails.price,
+      isAvailable: user.pharmacyDetails.isAvailable,
+      location: {
+        type: 'Point',
+        coordinates: [
+          parseFloat(user.pharmacyDetails.longitude),
+          parseFloat(user.pharmacyDetails.latitude)
+        ]
+      },
+      userEmail: user.email
+    };
+    
+    res.json(updatedPharmacy);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// Get All Pharmacy Users
+app.get('/api/pharmacy-users', async (req, res) => {
+    try {
+      const pharmacyUsers = await User.find({ role: 'pharmacy' });
+      
+      // Format pharmacy details for dashboard
+      const formattedPharmacies = pharmacyUsers.map(user => {
+        if (!user.pharmacyDetails) return null;
+        
+        return {
+          _id: user._id,
+          name: user.pharmacyDetails.pharmacyName,
+          address: user.pharmacyDetails.address,
+          medicineName: user.pharmacyDetails.medicineName,
+          price: user.pharmacyDetails.price,
+          isAvailable: user.pharmacyDetails.isAvailable,
+          location: {
+            type: 'Point',
+            coordinates: [
+              parseFloat(user.pharmacyDetails.longitude),
+              parseFloat(user.pharmacyDetails.latitude)
+            ]
+          },
+          userEmail: user.email
+        };
+      }).filter(pharmacy => pharmacy !== null);
+      
+      res.json(formattedPharmacies);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  // Get Pharmacy User by ID
+  app.get('/api/pharmacy-users/:id', async (req, res) => {
+    try {
+      const user = await User.findById(req.params.id);
+      if (!user || user.role !== 'pharmacy') {
+        return res.status(404).json({ message: 'Pharmacy not found' });
+      }
+      
+      const pharmacy = {
+        _id: user._id,
+        name: user.pharmacyDetails.pharmacyName,
+        address: user.pharmacyDetails.address,
+        medicineName: user.pharmacyDetails.medicineName,
+        price: user.pharmacyDetails.price,
+        isAvailable: user.pharmacyDetails.isAvailable,
+        location: {
+          type: 'Point',
+          coordinates: [
+            parseFloat(user.pharmacyDetails.longitude),
+            parseFloat(user.pharmacyDetails.latitude)
+          ]
+        },
+        userEmail: user.email
+      };
+      
+      res.json(pharmacy);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  
+  // Update Pharmacy User Details
+  app.put('/api/pharmacy-users/:id', async (req, res) => {
+    try {
+      const { name, address, medicineName, price, isAvailable, location } = req.body;
+      
+      const user = await User.findById(req.params.id);
+      if (!user || user.role !== 'pharmacy') {
+        return res.status(404).json({ message: 'Pharmacy not found' });
+      }
+      
+      // Update pharmacy details
+      user.pharmacyDetails = {
+        pharmacyName: name,
+        address,
+        medicineName,
+        price: parseFloat(price),
+        isAvailable: Boolean(isAvailable),
+        latitude: location.coordinates[1].toString(),
+        longitude: location.coordinates[0].toString()
+      };
+      
+      await user.save();
+      
+      // Format response
+      const updatedPharmacy = {
+        _id: user._id,
+        name: user.pharmacyDetails.pharmacyName,
+        address: user.pharmacyDetails.address,
+        medicineName: user.pharmacyDetails.medicineName,
+        price: user.pharmacyDetails.price,
+        isAvailable: user.pharmacyDetails.isAvailable,
+        location: {
+          type: 'Point',
+          coordinates: [
+            parseFloat(user.pharmacyDetails.longitude),
+            parseFloat(user.pharmacyDetails.latitude)
+          ]
+        },
+        userEmail: user.email
+      };
+      
+      res.json(updatedPharmacy);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
 // Register Endpoint
 app.post('/api/auth/register', async (req, res) => {
     try {
