@@ -259,6 +259,123 @@ app.delete('/api/pharmacies/:id', async (req, res) => {
     }
 });
 
+// Process Prescription Endpoint
+app.post('/api/process-prescription', async (req, res) => {
+    try {
+        const { imageText, userLocation } = req.body;
+        
+        if (!imageText || !imageText.trim()) {
+            return res.status(400).json({ message: 'No text detected in the prescription' });
+        }
+
+        // Extract medicine names from the detected text
+        // This is a simple implementation - in a production environment, 
+        // you would use NLP or a more sophisticated algorithm
+        const detectedMedicines = extractMedicineNames(imageText);
+        
+        if (!detectedMedicines || detectedMedicines.length === 0) {
+            return res.status(404).json({ message: 'No medicines detected in the prescription' });
+        }
+
+        // Find pharmacies with the detected medicines
+        const pharmaciesWithMedicines = await findPharmaciesWithMedicines(detectedMedicines, userLocation);
+        
+        res.json({
+            detectedMedicines,
+            pharmacies: pharmaciesWithMedicines
+        });
+    } catch (error) {
+        console.error('Prescription processing error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Helper function to extract medicine names from prescription text
+function extractMedicineNames(text) {
+    // Split the text into lines and words
+    const words = text.toLowerCase().split(/[\s,;]+/);
+    
+    // Filter out common words that are likely not medicine names
+    // This is a simplified approach - a real implementation would use a database of medicine names
+    const commonWords = ['prescription', 'mg', 'ml', 'tablet', 'capsule', 'syrup', 'take', 'daily', 'times', 
+                        'day', 'patient', 'name', 'doctor', 'hospital', 'date', 'dose'];
+    
+    // Extract potential medicine names (words with 4+ characters not in common words)
+    const potentialMedicines = words.filter(word => 
+        word.length >= 4 && 
+        !commonWords.includes(word) &&
+        !/^\d+$/.test(word) // Exclude numbers
+    );
+    
+    // Return unique medicine names
+    return [...new Set(potentialMedicines)];
+}
+
+// Helper function to find pharmacies with specified medicines
+async function findPharmaciesWithMedicines(medicines, userLocation) {
+    try {
+        // Default search radius in meters (10km)
+        const maxDistance = 10000;
+        
+        // If user location provided, search nearby pharmacies
+        let query = { isAvailable: true };
+        
+        // Create regex OR condition for medicine names
+        const medicineRegexes = medicines.map(med => new RegExp(med, 'i'));
+        query.medicineName = { $in: medicineRegexes };
+        
+        // Add geospatial query if user location is provided
+        if (userLocation && userLocation.latitude && userLocation.longitude) {
+            query.location = {
+                $nearSphere: {
+                    $geometry: {
+                        type: 'Point',
+                        coordinates: [parseFloat(userLocation.longitude), parseFloat(userLocation.latitude)]
+                    },
+                    $maxDistance: maxDistance
+                }
+            };
+        }
+        
+        // Find pharmacies matching the criteria
+        const pharmacies = await Pharmacy.find(query);
+        
+        return pharmacies.map(pharmacy => ({
+            id: pharmacy._id,
+            name: pharmacy.name,
+            address: pharmacy.address,
+            medicineName: pharmacy.medicineName,
+            price: pharmacy.price,
+            distance: userLocation ? calculateDistance(
+                userLocation.latitude, 
+                userLocation.longitude,
+                pharmacy.location.coordinates[1],
+                pharmacy.location.coordinates[0]
+            ) : null
+        }));
+    } catch (error) {
+        console.error('Error finding pharmacies:', error);
+        return [];
+    }
+}
+
+// Calculate distance between two points in kilometers
+function calculateDistance(lat1, lon1, lat2, lon2) {
+    const R = 6371; // Radius of the earth in km
+    const dLat = deg2rad(lat2 - lat1);
+    const dLon = deg2rad(lon2 - lon1); 
+    const a = 
+        Math.sin(dLat/2) * Math.sin(dLat/2) +
+        Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) * 
+        Math.sin(dLon/2) * Math.sin(dLon/2); 
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a)); 
+    return R * c; // Distance in km
+}
+
+function deg2rad(deg) {
+    return deg * (Math.PI/180);
+}
+
 // Server Start
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
