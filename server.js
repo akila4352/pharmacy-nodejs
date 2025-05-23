@@ -4,6 +4,15 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const FormData = require('form-data');
+const vision = require('@google-cloud/vision');
+const axios = require('axios');
+
+const upload = multer({ dest: 'uploads/' });
 
 const app = express();
 
@@ -109,6 +118,33 @@ const pharmacySchema = new mongoose.Schema({
 
 pharmacySchema.index({ location: '2dsphere' });
 const Pharmacy = mongoose.model('Pharmacy', pharmacySchema);
+
+// Pharmacy Calendar Schema
+const pharmacyCalendarSchema = new mongoose.Schema({
+    pharmacyId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Pharmacy',
+        required: true,
+    },
+    date: {
+        type: Date,
+        required: true,
+    },
+    openingTime: {
+        type: String,
+        required: true,
+    },
+    closingTime: {
+        type: String,
+        required: true,
+    },
+    isAvailable: {
+        type: Boolean,
+        default: true,
+    },
+});
+
+const PharmacyCalendar = mongoose.model('PharmacyCalendar', pharmacyCalendarSchema);
 
 // Auth Middleware
 const authMiddleware = (req, res, next) => {
@@ -407,37 +443,41 @@ app.get('/api/pharmacies/owner/:ownerId', async (req, res) => {
     }
 });
 
-// Search Nearby Pharmacies
+// Search Pharmacies by Medicine Name (with or without location)
 app.get('/api/pharmacies/search', async (req, res) => {
     try {
         const { latitude, longitude, medicineName } = req.query;
-        
-        if (!latitude || !longitude) {
-            return res.status(400).json({ message: 'Latitude and longitude are required' });
+
+        let pharmacies = [];
+        if (latitude && longitude) {
+            // Nearby search
+            const query = {
+                location: {
+                    $nearSphere: {
+                        $geometry: {
+                            type: 'Point',
+                            coordinates: [parseFloat(longitude), parseFloat(latitude)]
+                        },
+                        $maxDistance: 10000 // 10km
+                    }
+                }
+            };
+            pharmacies = await Pharmacy.find(query).populate('ownerId', 'name email phone');
+        } else {
+            // All pharmacies
+            pharmacies = await Pharmacy.find().populate('ownerId', 'name email phone');
         }
 
-        const query = {
-            location: {
-                $nearSphere: {
-                    $geometry: {
-                        type: 'Point',
-                        coordinates: [parseFloat(longitude), parseFloat(latitude)]
-                    },
-                    $maxDistance: 10000 // 10km
-                }
-            }
-        };
-
-        const pharmacies = await Pharmacy.find(query).populate('ownerId', 'name email phone');
-
         // Filter by medicine name if provided
-        const filteredPharmacies = medicineName
-            ? pharmacies.filter(pharmacy =>
-                pharmacy.stock.some(stockItem =>
-                    new RegExp(medicineName, 'i').test(stockItem.medicineName)
+        let filteredPharmacies = pharmacies;
+        if (medicineName) {
+            filteredPharmacies = pharmacies.filter(pharmacy =>
+                (pharmacy.stock || []).some(stockItem =>
+                    stockItem.medicineName &&
+                    stockItem.medicineName.toLowerCase() === medicineName.toLowerCase()
                 )
-            )
-            : pharmacies;
+            );
+        }
 
         res.json(filteredPharmacies);
     } catch (err) {
@@ -544,6 +584,77 @@ app.put('/api/pharmacies/:id', async (req, res) => {
     }
 });
 
+// Update Pharmacy Opening/Closing Times and Availability
+app.put('/api/pharmacies/:id/calendar', async (req, res) => {
+    try {
+        const { openingTime, closingTime, isAvailable } = req.body;
+
+        // Ensure valid ObjectId
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+            return res.status(400).json({ message: 'Invalid pharmacy ID format' });
+        }
+
+        const updatedPharmacy = await Pharmacy.findByIdAndUpdate(
+            req.params.id,
+            { openingTime, closingTime, isAvailable },
+            { new: true }
+        );
+
+        if (!updatedPharmacy) return res.status(404).json({ message: 'Pharmacy not found' });
+
+        res.json(updatedPharmacy);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Add or Update Calendar Entry
+app.post('/api/pharmacies/:id/calendar', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { date, openingTime, closingTime, isAvailable } = req.body;
+
+        // Ensure valid ObjectId
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid pharmacy ID format' });
+        }
+
+        // Check if the pharmacy exists
+        const pharmacy = await Pharmacy.findById(id);
+        if (!pharmacy) {
+            return res.status(404).json({ message: 'Pharmacy not found' });
+        }
+
+        // Upsert calendar entry
+        const calendarEntry = await PharmacyCalendar.findOneAndUpdate(
+            { pharmacyId: id, date },
+            { openingTime, closingTime, isAvailable },
+            { new: true, upsert: true }
+        );
+
+        res.status(200).json(calendarEntry);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Get Calendar Entries for a Pharmacy
+app.get('/api/pharmacies/:id/calendar', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Ensure valid ObjectId
+        if (!mongoose.Types.ObjectId.isValid(id)) {
+            return res.status(400).json({ message: 'Invalid pharmacy ID format' });
+        }
+
+        const calendarEntries = await PharmacyCalendar.find({ pharmacyId: id });
+        res.status(200).json(calendarEntries);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Delete Pharmacy
 app.delete('/api/pharmacies/:id', async (req, res) => {
     try {
@@ -556,6 +667,16 @@ app.delete('/api/pharmacies/:id', async (req, res) => {
         if (!deleted) return res.status(404).json({ message: 'Pharmacy not found' });
         
         res.json({ message: 'Deleted successfully' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Update Pharmacy Availability to Always Be "Available"
+app.put('/api/pharmacies/fix-availability', async (req, res) => {
+    try {
+        await Pharmacy.updateMany({}, { isAvailable: true });
+        res.json({ message: 'All pharmacies are now marked as available.' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -649,6 +770,86 @@ app.post('/api/pharmacies/update-stock-bulk', authMiddleware, async (req, res) =
     } catch (err) {
         console.error("Error updating bulk stock:", err);
         res.status(500).json({ message: "Internal server error" });
+    }
+});
+
+// Prescription OCR endpoint using Google Gemini Vision 2.0 API
+app.post('/api/prescription/scan', upload.single('prescription'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+
+        // Only allow image files
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/bmp', 'image/gif', 'image/tiff', 'image/webp'];
+        if (!allowedTypes.includes(req.file.mimetype)) {
+            fs.unlink(req.file.path, () => {});
+            return res.status(400).json({ error: 'Unsupported file type' });
+        }
+
+        // Read file and encode to base64
+        const imageBuffer = fs.readFileSync(req.file.path);
+        const base64Image = imageBuffer.toString('base64');
+
+        // Clean up uploaded file
+        fs.unlink(req.file.path, () => {});
+
+        // Gemini Vision API endpoint and key
+        const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyAquE8L7ug-kfoJ-s3b4WUDvUUZgCi_2cg';
+        // Use the supported Gemini 1.5 model endpoint for vision (as of July 2024)
+        // See: https://ai.google.dev/gemini-api/docs/models/gemini
+        const geminiUrl = 'https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=' + GEMINI_API_KEY;
+
+        // Prepare Gemini Vision API request
+        const geminiReq = {
+            contents: [
+                {
+                    parts: [
+                        {
+                            text: "Extract all readable text from this prescription image. Return only the text, no explanation."
+                        },
+                        {
+                            inlineData: {
+                                mimeType: req.file.mimetype,
+                                data: base64Image
+                            }
+                        }
+                    ]
+                }
+            ]
+        };
+
+        // Call Gemini Vision API
+        let geminiRes;
+        try {
+            geminiRes = await axios.post(geminiUrl, geminiReq, {
+                headers: { 'Content-Type': 'application/json' }
+            });
+        } catch (apiErr) {
+            // Handle Gemini API errors (404, 401, etc.)
+            const apiMessage = apiErr.response?.data?.error?.message || apiErr.message || "Gemini Vision API request failed";
+            return res.status(apiErr.response?.status || 500).json({ error: apiMessage });
+        }
+
+        // Parse Gemini response
+        let rawText = '';
+        if (
+            geminiRes.data &&
+            geminiRes.data.candidates &&
+            geminiRes.data.candidates.length > 0 &&
+            geminiRes.data.candidates[0].content &&
+            geminiRes.data.candidates[0].content.parts &&
+            geminiRes.data.candidates[0].content.parts.length > 0
+        ) {
+            rawText = geminiRes.data.candidates[0].content.parts[0].text || '';
+        }
+
+        res.json({ rawText });
+    } catch (err) {
+        if (req.file?.path) {
+            fs.unlink(req.file.path, () => {});
+        }
+        res.status(500).json({ error: err.message });
     }
 });
 
