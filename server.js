@@ -11,6 +11,7 @@ const path = require('path');
 const FormData = require('form-data');
 const vision = require('@google-cloud/vision');
 const axios = require('axios');
+const nodemailer = require('nodemailer');
 
 const upload = multer({ dest: 'uploads/' });
 
@@ -73,7 +74,10 @@ const userSchema = new mongoose.Schema({
     createdAt: {
         type: Date,
         default: Date.now
-    }
+    },
+    isEmailVerified: { type: Boolean, default: false },
+    otp: String,
+    otpExpires: Date,
 });
 
 // Password hash
@@ -160,7 +164,36 @@ const authMiddleware = (req, res, next) => {
     }
 };
 
-// Register Endpoint
+// Nodemailer transporter
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER, // set in .env
+        pass: process.env.EMAIL_PASS  // set in .env
+    }
+});
+
+// Add this check to log missing credentials for easier debugging
+if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+    console.error('❌ Missing EMAIL_USER or EMAIL_PASS in your environment variables (.env file).');
+    // Optionally, you can exit the process if credentials are missing:
+    // process.exit(1);
+}
+
+// Helper to send OTP email
+async function sendOTPEmail(to, otp) {
+    await transporter.sendMail({
+        from: process.env.EMAIL_USER,
+        to,
+        subject: 'Your OTP Verification Code',
+        text: `Your OTP code is: ${otp}`
+    });
+}
+
+// Temporary in-memory store for pending registrations
+const pendingRegistrations = {};
+
+// Register Endpoint (store pending, don't save to DB yet)
 app.post('/api/auth/register', async (req, res) => {
     try {
         const {
@@ -193,7 +226,12 @@ app.post('/api/auth/register', async (req, res) => {
             }
         }
 
-        const newUser = new User({
+        // Generate OTP
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+
+        // Store all registration data in memory with OTP
+        pendingRegistrations[email] = {
             firstName,
             lastName,
             name: `${firstName} ${lastName}`,
@@ -203,45 +241,105 @@ app.post('/api/auth/register', async (req, res) => {
             phone,
             role,
             isActive: true,
-            ...(role === 'pharmacy' && {
-                pharmacyDetails: {
-                    pharmacyName,
-                    address,
-                    medicineName,
-                    price,
-                    latitude,
-                    longitude,
-                    isAvailable
-                }
-            })
-        });
-
-        await newUser.save();
-        
-        // If user is a pharmacy owner, create a pharmacy entry as well
-        if (role === 'pharmacy') {
-            const newPharmacy = new Pharmacy({
-                name: pharmacyName,
+            isEmailVerified: false,
+            otp,
+            otpExpires,
+            pharmacyDetails: (role === 'pharmacy' ? {
+                pharmacyName,
                 address,
+                medicineName,
+                price,
+                latitude,
+                longitude,
+                isAvailable
+            } : undefined)
+        };
+
+        // Send OTP email
+        await sendOTPEmail(email, otp);
+
+        res.status(201).json({ message: 'OTP sent to email. Please verify to complete registration.' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Verify OTP Endpoint (save user to DB if OTP correct)
+app.post('/api/auth/verify-otp', async (req, res) => {
+    try {
+        const { email, otp } = req.body;
+        const pending = pendingRegistrations[email];
+        if (!pending) return res.status(404).json({ success: false, message: 'No pending registration found. Please register again.' });
+        if (pending.otp !== otp) {
+            return res.status(400).json({ success: false, message: 'Invalid OTP' });
+        }
+        if (pending.otpExpires < new Date()) {
+            delete pendingRegistrations[email];
+            return res.status(400).json({ success: false, message: 'OTP expired. Please register again.' });
+        }
+
+        // Save user to DB
+        const userObj = { ...pending };
+        delete userObj.otp;
+        delete userObj.otpExpires;
+        userObj.isEmailVerified = true;
+
+        // Hash password before saving
+        const salt = await bcrypt.genSalt(10);
+        userObj.password = await bcrypt.hash(userObj.password, salt);
+
+        const newUser = new User(userObj);
+        await newUser.save();
+
+        // If user is a pharmacy owner, create pharmacy entry
+        if (userObj.role === 'pharmacy') {
+            const pd = userObj.pharmacyDetails;
+            const newPharmacy = new Pharmacy({
+                name: pd.pharmacyName,
+                address: pd.address,
                 ownerId: newUser._id,
                 location: {
                     type: 'Point',
-                    coordinates: [parseFloat(longitude), parseFloat(latitude)]
+                    coordinates: [parseFloat(pd.longitude), parseFloat(pd.latitude)]
                 },
                 stock: [
                     {
-                        medicineName,
-                        price: parseFloat(price),
-                        isAvailable: isAvailable !== false
+                        medicineName: pd.medicineName,
+                        price: parseFloat(pd.price),
+                        isAvailable: pd.isAvailable !== false
                     }
                 ]
             });
             await newPharmacy.save();
         }
-        
-        res.status(201).json({ message: 'User registered successfully' });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+
+        // Remove from pending
+        delete pendingRegistrations[email];
+
+        res.json({ success: true, message: 'Email verified and registration complete.' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Resend OTP Endpoint (regenerate OTP for pending registration)
+app.post('/api/auth/resend-otp', async (req, res) => {
+    try {
+        const { email } = req.body;
+        const pending = pendingRegistrations[email];
+        if (!pending) return res.status(404).json({ success: false, message: 'No pending registration found. Please register again.' });
+
+        // Generate new OTP
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+        pending.otp = otp;
+        pending.otpExpires = otpExpires;
+
+        await sendOTPEmail(email, otp);
+
+        res.json({ success: true, message: 'OTP resent successfully' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
     }
 });
 
@@ -850,6 +948,57 @@ app.post('/api/prescription/scan', upload.single('prescription'), async (req, re
             fs.unlink(req.file.path, () => {});
         }
         res.status(500).json({ error: err.message });
+    }
+});
+
+// In-memory store for password reset OTPs
+const passwordResetOtps = {};
+
+// Forgot Password Endpoint (send OTP)
+app.post('/api/auth/forgot-password', async (req, res) => {
+    try {
+        const { email } = req.body;
+        const user = await User.findOne({ email });
+        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+        // Generate OTP
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        const otpExpires = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+
+        passwordResetOtps[email] = { otp, otpExpires };
+
+        await sendOTPEmail(email, otp);
+
+        res.json({ success: true, message: 'OTP sent to your email.' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Reset Password Endpoint (verify OTP and set new password)
+app.post('/api/auth/reset-password', async (req, res) => {
+    try {
+        const { email, otp, newPassword } = req.body;
+        const user = await User.findOne({ email });
+        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+        const record = passwordResetOtps[email];
+        if (!record) return res.status(400).json({ success: false, message: 'No OTP request found. Please request again.' });
+        if (record.otp !== otp) return res.status(400).json({ success: false, message: 'Invalid OTP' });
+        if (record.otpExpires < new Date()) {
+            delete passwordResetOtps[email];
+            return res.status(400).json({ success: false, message: 'OTP expired. Please request again.' });
+        }
+
+        // Update password (ensure pre-save hook is called)
+        user.password = newPassword;
+        await user.save();
+
+        delete passwordResetOtps[email];
+
+        res.json({ success: true, message: 'Password reset successful. You can now login.' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
     }
 });
 

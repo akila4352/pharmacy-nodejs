@@ -12,6 +12,7 @@
     "mongoose": "^8.10.1",
     "multer": "^2.0.0",
     "node-fetch": "^3.3.2",
+    "nodemailer": "^7.0.3",
     "python-shell": "^5.0.0",
     "sharp": "^0.34.2"
   }
