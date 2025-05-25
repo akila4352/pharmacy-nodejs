@@ -18,7 +18,13 @@ const upload = multer({ dest: 'uploads/' });
 const app = express();
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: [
+    'http://localhost:3000',
+    'https://pharmacy-krpq-eqgupb0na-akilas-projects-cefe165a.vercel.app'
+  ],
+  credentials: true,
+}));
 app.use(express.json({ limit: "50mb" })); // Increase JSON payload limit
 app.use(express.urlencoded({ limit: "50mb", extended: true })); // Increase URL-encoded payload limit
 
