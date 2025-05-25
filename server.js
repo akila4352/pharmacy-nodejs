@@ -111,9 +111,11 @@ const pharmacySchema = new mongoose.Schema({
         {
             medicineName: String,
             price: Number,
-            isAvailable: { type: Boolean, default: true }
+            isAvailable: { type: Boolean, default: true },
+            quantity: { type: Number, default: 0 } // <-- add this
         }
     ],
+    photoUrl: String, // <-- add this field
     createdAt: {
         type: Date,
         default: Date.now
@@ -149,6 +151,14 @@ const pharmacyCalendarSchema = new mongoose.Schema({
 });
 
 const PharmacyCalendar = mongoose.model('PharmacyCalendar', pharmacyCalendarSchema);
+
+// Medicine Search Schema
+const medicineSearchSchema = new mongoose.Schema({
+    medicineName: { type: String, required: true, unique: true }, // Make unique
+    count: { type: Number, default: 1 }, // Add count field
+    searchedAt: { type: Date, default: Date.now }
+});
+const MedicineSearch = mongoose.model('MedicineSearch', medicineSearchSchema);
 
 // Auth Middleware
 const authMiddleware = (req, res, next) => {
@@ -187,6 +197,16 @@ async function sendOTPEmail(to, otp) {
         to,
         subject: 'Your OTP Verification Code',
         text: `Your OTP code is: ${otp}`
+    });
+}
+
+// Helper to send low stock email
+async function sendLowStockEmail(to, medicineName, quantity) {
+    await transporter.sendMail({
+        from: process.env.EMAIL_USER,
+        to,
+        subject: `Low Stock Alert: ${medicineName}`,
+        text: `Warning: The stock for "${medicineName}" is low (current quantity: ${quantity}). Please restock soon.`
     });
 }
 
@@ -284,9 +304,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         delete userObj.otpExpires;
         userObj.isEmailVerified = true;
 
-        // Hash password before saving
-        const salt = await bcrypt.genSalt(10);
-        userObj.password = await bcrypt.hash(userObj.password, salt);
+        // Do NOT hash password here! Let the pre-save hook handle it.
 
         const newUser = new User(userObj);
         await newUser.save();
@@ -349,12 +367,23 @@ app.post('/api/auth/login', async (req, res) => {
         const { email, password, role } = req.body;
         const user = await User.findOne({ email });
 
-        if (!user) return res.status(404).json({ message: 'User not found' });
+        if (!user) {
+            console.log(`[LOGIN] User not found for email: ${email}`);
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        // Add debug: show password hashes for troubleshooting
+        // console.log(`[LOGIN] User password hash: ${user.password}`);
+        // console.log(`[LOGIN] Provided password: ${password}`);
 
         const isMatch = await user.comparePassword(password);
-        if (!isMatch) return res.status(401).json({ message: 'Invalid credentials' });
+        if (!isMatch) {
+            console.log(`[LOGIN] Password mismatch for email: ${email}`);
+            return res.status(401).json({ message: 'Invalid credentials' });
+        }
 
         if (user.role !== role) {
+            console.log(`[LOGIN] Role mismatch for email: ${email}. Expected: ${user.role}, Provided: ${role}`);
             return res.status(401).json({
                 message: 'Invalid role selected. Please select the correct role for your account.'
             });
@@ -806,7 +835,7 @@ app.get('/api/stats', async (req, res) => {
 // Update Single Stock
 app.post('/api/pharmacies/update-stock', authMiddleware, async (req, res) => {
     try {
-        const { medicineName, price, isAvailable } = req.body;
+        const { medicineName, price, isAvailable, quantity } = req.body;
 
         // Ensure the user is a pharmacy owner
         const pharmacy = await Pharmacy.findOne({ ownerId: req.user.id });
@@ -815,20 +844,47 @@ app.post('/api/pharmacies/update-stock', authMiddleware, async (req, res) => {
         }
 
         // Check if the medicine already exists in the stock
-        const existingMedicine = pharmacy.stock.find(
+        let existingMedicine = pharmacy.stock.find(
             (item) => item.medicineName.toLowerCase() === medicineName.toLowerCase()
         );
+
+        let sendLowStock = false;
+        let newQuantity = quantity !== undefined ? Number(quantity) : 0;
 
         if (existingMedicine) {
             // Update existing medicine
             existingMedicine.price = price;
             existingMedicine.isAvailable = isAvailable;
+            if (quantity !== undefined) {
+                existingMedicine.quantity = newQuantity;
+            }
+            if (existingMedicine.quantity !== undefined && existingMedicine.quantity < 100) {
+                sendLowStock = true;
+            }
         } else {
             // Add new medicine to stock
-            pharmacy.stock.push({ medicineName, price, isAvailable });
+            pharmacy.stock.push({
+                medicineName,
+                price,
+                isAvailable,
+                quantity: newQuantity
+            });
+            if (newQuantity < 100) {
+                sendLowStock = true;
+            }
+            existingMedicine = pharmacy.stock[pharmacy.stock.length - 1];
         }
 
         await pharmacy.save();
+
+        // Always send low stock alert if quantity < 100
+        if (sendLowStock) {
+            const owner = await User.findById(pharmacy.ownerId);
+            if (owner && owner.email) {
+                await sendLowStockEmail(owner.email, existingMedicine.medicineName, existingMedicine.quantity);
+            }
+        }
+
         res.status(200).json({ message: "Stock updated successfully", pharmacy });
     } catch (err) {
         console.error("Error updating stock:", err);
@@ -847,21 +903,44 @@ app.post('/api/pharmacies/update-stock-bulk', authMiddleware, async (req, res) =
             return res.status(404).json({ message: "Pharmacy not found for this owner" });
         }
 
-        // Update or add each medicine in the stock
-        stock.forEach((newItem) => {
-            const existingMedicine = pharmacy.stock.find(
+        for (const newItem of stock) {
+            let existingMedicine = pharmacy.stock.find(
                 (item) => item.medicineName.toLowerCase() === newItem.medicineName.toLowerCase()
             );
 
+            let sendLowStock = false;
+            let newQuantity = newItem.quantity !== undefined ? Number(newItem.quantity) : 0;
+
             if (existingMedicine) {
-                // Update existing medicine
                 existingMedicine.price = newItem.price;
                 existingMedicine.isAvailable = newItem.isAvailable;
+                if (newItem.quantity !== undefined) {
+                    existingMedicine.quantity = newQuantity;
+                }
+                if (existingMedicine.quantity !== undefined && existingMedicine.quantity < 100) {
+                    sendLowStock = true;
+                }
             } else {
-                // Add new medicine to stock
-                pharmacy.stock.push(newItem);
+                pharmacy.stock.push({
+                    medicineName: newItem.medicineName,
+                    price: newItem.price,
+                    isAvailable: newItem.isAvailable,
+                    quantity: newQuantity
+                });
+                if (newQuantity < 100) {
+                    sendLowStock = true;
+                }
+                existingMedicine = pharmacy.stock[pharmacy.stock.length - 1];
             }
-        });
+
+            // Always send low stock alert if quantity < 100
+            if (sendLowStock) {
+                const owner = await User.findById(pharmacy.ownerId);
+                if (owner && owner.email) {
+                    await sendLowStockEmail(owner.email, existingMedicine.medicineName, existingMedicine.quantity);
+                }
+            }
+        }
 
         await pharmacy.save();
         res.status(200).json({ message: "Bulk stock updated successfully", pharmacy });
@@ -1002,6 +1081,61 @@ app.post('/api/auth/reset-password', async (req, res) => {
     }
 });
 
+// Save medicine search (increment count or create new)
+app.post('/api/medicine-search', async (req, res) => {
+    try {
+        let { medicineName } = req.body;
+        if (!medicineName) return res.status(400).json({ message: "medicineName required" });
+        medicineName = medicineName.trim().toLowerCase();
+
+        // Try to update count if exists, else insert new
+        const result = await MedicineSearch.findOneAndUpdate(
+            { medicineName },
+            { $inc: { count: 1 }, $set: { searchedAt: new Date() } },
+            { upsert: true, new: true }
+        );
+        res.json({ success: true, medicine: result });
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// Get all searched medicine names and their total search count (from all time)
+app.get('/api/medicine-search/all', async (req, res) => {
+    try {
+        const medicines = await MedicineSearch.find({}, { _id: 0, medicineName: 1, count: 1 }).sort({ count: -1 });
+        res.json({
+            medicines: medicines.map(m => ({
+                name: m.medicineName,
+                count: m.count
+            }))
+        });
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// Medicine name suggestions endpoint for autocomplete
+app.get('/api/medicines/suggestions', async (req, res) => {
+    try {
+        const { query } = req.query;
+        if (!query || !query.trim()) {
+            return res.json([]);
+        }
+        // Find medicine names starting with the query, sorted by count
+        const suggestions = await MedicineSearch.find(
+            { medicineName: { $regex: '^' + query.trim().toLowerCase(), $options: 'i' } },
+            { _id: 0, medicineName: 1 }
+        )
+        .sort({ count: -1 })
+        .limit(10);
+
+        res.json(suggestions.map(m => m.medicineName));
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
 // Global error handler
 app.use((err, req, res, next) => {
   console.error(err.stack);
@@ -1011,6 +1145,64 @@ app.use((err, req, res, next) => {
 // Catch-all route for undefined endpoints
 app.use((req, res) => {
   res.status(404).json({ message: "Endpoint not found" });
+});
+
+// Serve uploaded images statically
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Upload/update pharmacy photo endpoint
+app.post('/api/pharmacies/:id/photo', upload.single('photo'), async (req, res) => {
+    try {
+        if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+            if (req.file?.path) fs.unlink(req.file.path, () => {});
+            return res.status(400).json({ message: 'Invalid pharmacy ID format' });
+        }
+        if (!req.file) {
+            return res.status(400).json({ message: 'No file uploaded' });
+        }
+        // Only allow image files
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/jpg', 'image/bmp', 'image/gif', 'image/tiff', 'image/webp'];
+        if (!allowedTypes.includes(req.file.mimetype)) {
+            fs.unlink(req.file.path, () => {});
+            return res.status(400).json({ message: 'Unsupported file type' });
+        }
+
+        // Move file to /uploads with a unique name
+        const ext = path.extname(req.file.originalname) || '.jpg';
+        const newFilename = `pharmacy_${req.params.id}_${Date.now()}${ext}`;
+        const newPath = path.join(__dirname, 'uploads', newFilename);
+        fs.renameSync(req.file.path, newPath);
+
+        // Build the public URL
+        const photoUrl = `/uploads/${newFilename}`;
+
+        // Update pharmacy document
+        const updated = await Pharmacy.findByIdAndUpdate(
+            req.params.id,
+            { photoUrl },
+            { new: true }
+        );
+        if (!updated) {
+            fs.unlink(newPath, () => {});
+            return res.status(404).json({ message: 'Pharmacy not found' });
+        }
+        res.json(updated);
+    } catch (err) {
+        if (req.file?.path) fs.unlink(req.file.path, () => {});
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// Get current pharmacy for logged-in owner (for dashboard profile)
+app.get('/api/pharmacies/my', async (req, res) => {
+    try {
+        // For demo, get first pharmacy (replace with auth in production)
+        const pharmacy = await Pharmacy.findOne();
+        if (!pharmacy) return res.status(404).json({ message: 'Pharmacy not found' });
+        res.json(pharmacy);
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
 });
 
 // Server Start
