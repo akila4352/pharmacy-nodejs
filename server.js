@@ -4,12 +4,15 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const path = require('path');
 
 const app = express();
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // MongoDB Connection
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://akilanirmal2020:d1QbcRXU2aS10Dqe@cluster0.rm7l3.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0";
@@ -89,6 +92,57 @@ const pharmacySchema = new mongoose.Schema({
 });
 pharmacySchema.index({ location: '2dsphere' });
 const Pharmacy = mongoose.model('Pharmacy', pharmacySchema);
+
+// Chat Message Schema
+const chatMessageSchema = new mongoose.Schema({
+    userId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        required: true
+    },
+    text: String,
+    sender: String, // 'patient', 'admin'
+    timestamp: {
+        type: Date,
+        default: Date.now
+    },
+    image: String, // Base64 encoded image
+    read: {
+        type: Boolean,
+        default: false
+    }
+});
+
+const ChatMessage = mongoose.model('ChatMessage', chatMessageSchema);
+
+// Authentication middleware
+const authenticate = async (req, res, next) => {
+    try {
+        const token = req.headers.authorization?.split(' ')[1];
+        if (!token) {
+            return res.status(401).json({ message: 'Authentication required' });
+        }
+
+        const decoded = jwt.verify(token, JWT_SECRET);
+        const user = await User.findById(decoded.id);
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        req.user = user;
+        next();
+    } catch (error) {
+        return res.status(401).json({ message: 'Invalid or expired token' });
+    }
+};
+
+// Admin authorization middleware
+const authorizeAdmin = (req, res, next) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: 'Access denied. Admin role required.' });
+    }
+    next();
+};
 
 // Register Endpoint
 app.post('/api/auth/register', async (req, res) => {
@@ -375,6 +429,184 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
 function deg2rad(deg) {
     return deg * (Math.PI/180);
 }
+
+// ========================
+// CHAT FUNCTIONALITY ENDPOINTS
+// ========================
+
+// Get chat history for a user
+app.get('/api/chat/history', authenticate, async (req, res) => {
+    try {
+        const userId = req.query.userId || req.user._id;
+        
+        // Find all messages for this user
+        const messages = await ChatMessage.find({ userId })
+            .sort({ timestamp: 1 });
+        
+        res.json({ messages });
+    } catch (error) {
+        console.error('Error fetching chat history:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Send a new message
+app.post('/api/chat/message', authenticate, async (req, res) => {
+    try {
+        const { text, image } = req.body;
+        const userId = req.body.userId || req.user._id;
+        
+        if (!text && !image) {
+            return res.status(400).json({ message: 'Message must contain text or image' });
+        }
+        
+        // Create new message
+        const newMessage = new ChatMessage({
+            userId,
+            text,
+            sender: 'patient',
+            image,
+            timestamp: new Date(),
+            read: false
+        });
+        
+        await newMessage.save();
+        res.status(201).json(newMessage);
+    } catch (error) {
+        console.error('Error sending message:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get all patients with messages (for admin)
+app.get('/api/chat/patients', authenticate, authorizeAdmin, async (req, res) => {
+    try {
+        // Find distinct users who have sent messages
+        const userMessages = await ChatMessage.aggregate([
+            { $sort: { timestamp: -1 } },
+            {
+                $group: {
+                    _id: '$userId',
+                    lastMessage: { $first: '$text' },
+                    lastTimestamp: { $first: '$timestamp' },
+                    messages: { $push: '$$ROOT' },
+                    unreadCount: {
+                        $sum: {
+                            $cond: [{ $eq: ['$read', false] }, 1, 0]
+                        }
+                    }
+                }
+            },
+            { $sort: { lastTimestamp: -1 } }
+        ]);
+        
+        // Get user details for each patient
+        const patients = [];
+        for (const userMsg of userMessages) {
+            const user = await User.findById(userMsg._id);
+            if (user) {
+                patients.push({
+                    id: user._id,
+                    name: `${user.firstName} ${user.lastName}`,
+                    email: user.email,
+                    unread: userMsg.unreadCount,
+                    lastMessage: userMsg.lastMessage,
+                    timestamp: userMsg.lastTimestamp,
+                    messages: userMsg.messages.map(msg => ({
+                        id: msg._id,
+                        text: msg.text,
+                        sender: msg.sender,
+                        timestamp: msg.timestamp,
+                        image: msg.image,
+                        read: msg.read
+                    }))
+                });
+            }
+        }
+        
+        res.json(patients);
+    } catch (error) {
+        console.error('Error fetching patients:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Get messages for a specific patient
+app.get('/api/chat/messages/:patientId', authenticate, authorizeAdmin, async (req, res) => {
+    try {
+        const patientId = req.params.patientId;
+        
+        // Find all messages for this patient
+        const messages = await ChatMessage.find({ userId: patientId })
+            .sort({ timestamp: 1 });
+        
+        const user = await User.findById(patientId);
+        if (!user) {
+            return res.status(404).json({ message: 'Patient not found' });
+        }
+        
+        res.json({
+            id: user._id,
+            name: `${user.firstName} ${user.lastName}`,
+            email: user.email,
+            messages: messages.map(msg => ({
+                id: msg._id,
+                text: msg.text,
+                sender: msg.sender,
+                timestamp: msg.timestamp,
+                image: msg.image,
+                read: msg.read
+            }))
+        });
+    } catch (error) {
+        console.error('Error fetching patient messages:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Mark messages as read
+app.put('/api/chat/markAsRead/:patientId', authenticate, authorizeAdmin, async (req, res) => {
+    try {
+        const patientId = req.params.patientId;
+        
+        // Mark all unread messages from this patient as read
+        const result = await ChatMessage.updateMany(
+            { userId: patientId, read: false },
+            { $set: { read: true } }
+        );
+        
+        res.json({ message: `Marked ${result.nModified} messages as read` });
+    } catch (error) {
+        console.error('Error marking messages as read:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Send message as admin
+app.post('/api/chat/admin/message', authenticate, authorizeAdmin, async (req, res) => {
+    try {
+        const { patientId, text } = req.body;
+        
+        if (!text) {
+            return res.status(400).json({ message: 'Message text is required' });
+        }
+        
+        // Create new message
+        const newMessage = new ChatMessage({
+            userId: patientId,
+            text,
+            sender: 'admin',
+            timestamp: new Date(),
+            read: false
+        });
+        
+        await newMessage.save();
+        res.status(201).json(newMessage);
+    } catch (error) {
+        console.error('Error sending admin message:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
 
 // Server Start
 const PORT = process.env.PORT || 5000;
