@@ -1271,6 +1271,6 @@ app.get('/api/pharmacies/my', async (req, res) => {
     }
 });
 
-// Server Start
+// Server Start 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
