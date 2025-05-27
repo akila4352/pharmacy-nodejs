@@ -981,12 +981,10 @@ app.post('/api/prescription/scan', upload.single('prescription'), async (req, re
 
         // Gemini Vision API endpoint and key
         const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'AIzaSyAquE8L7ug-kfoJ-s3b4WUDvUUZgCi_2cg';
-        // Use the supported Gemini 1.5 model endpoint for vision (as of July 2024)
-        // See: https://ai.google.dev/gemini-api/docs/models/gemini
         const geminiUrl = 'https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=' + GEMINI_API_KEY;
 
-        // Prepare Gemini Vision API request
-        const geminiReq = {
+        // 1. Extract all text
+        const geminiReqText = {
             contents: [
                 {
                     parts: [
@@ -1004,32 +1002,92 @@ app.post('/api/prescription/scan', upload.single('prescription'), async (req, re
             ]
         };
 
-        // Call Gemini Vision API
-        let geminiRes;
+        let geminiResText;
         try {
-            geminiRes = await axios.post(geminiUrl, geminiReq, {
+            geminiResText = await axios.post(geminiUrl, geminiReqText, {
                 headers: { 'Content-Type': 'application/json' }
             });
         } catch (apiErr) {
-            // Handle Gemini API errors (404, 401, etc.)
             const apiMessage = apiErr.response?.data?.error?.message || apiErr.message || "Gemini Vision API request failed";
             return res.status(apiErr.response?.status || 500).json({ error: apiMessage });
         }
 
-        // Parse Gemini response
         let rawText = '';
         if (
-            geminiRes.data &&
-            geminiRes.data.candidates &&
-            geminiRes.data.candidates.length > 0 &&
-            geminiRes.data.candidates[0].content &&
-            geminiRes.data.candidates[0].content.parts &&
-            geminiRes.data.candidates[0].content.parts.length > 0
+            geminiResText.data &&
+            geminiResText.data.candidates &&
+            geminiResText.data.candidates.length > 0 &&
+            geminiResText.data.candidates[0].content &&
+            geminiResText.data.candidates[0].content.parts &&
+            geminiResText.data.candidates[0].content.parts.length > 0
         ) {
-            rawText = geminiRes.data.candidates[0].content.parts[0].text || '';
+            rawText = geminiResText.data.candidates[0].content.parts[0].text || '';
         }
 
-        res.json({ rawText });
+        // 2. Extract structured medication details from the text
+        // Use Gemini again for structured extraction
+        const geminiReqMedications = {
+            contents: [
+                {
+                    parts: [
+                        {
+                            text:
+`Given the following prescription text, extract a JSON array of medications with the following fields if available: medicineName, dosage, frequency, duration, instructions. 
+Return ONLY a JSON array, e.g.:
+[
+  {"medicineName": "...", "dosage": "...", "frequency": "...", "duration": "...", "instructions": "..."},
+  ...
+]
+Prescription text:
+${rawText}`
+                        }
+                    ]
+                }
+            ]
+        };
+
+        let medications = {};
+        try {
+            const geminiResMedications = await axios.post(geminiUrl, geminiReqMedications, {
+                headers: { 'Content-Type': 'application/json' }
+            });
+            let medsText = '';
+            if (
+                geminiResMedications.data &&
+                geminiResMedications.data.candidates &&
+                geminiResMedications.data.candidates.length > 0 &&
+                geminiResMedications.data.candidates[0].content &&
+                geminiResMedications.data.candidates[0].content.parts &&
+                geminiResMedications.data.candidates[0].content.parts.length > 0
+            ) {
+                medsText = geminiResMedications.data.candidates[0].content.parts[0].text || '';
+            }
+            // Try to parse JSON array
+            let medsArr = [];
+            try {
+                medsArr = JSON.parse(medsText);
+            } catch (e) {
+                // fallback: try to extract JSON array from text
+                const match = medsText.match(/\[.*\]/s);
+                if (match) {
+                    medsArr = JSON.parse(match[0]);
+                }
+            }
+            // Convert array to object keyed by medicineName for frontend
+            if (Array.isArray(medsArr)) {
+                medications = {};
+                medsArr.forEach(med => {
+                    if (med.medicineName) {
+                        medications[med.medicineName] = med;
+                    }
+                });
+            }
+        } catch (err) {
+            // If Gemini fails, just return rawText
+            medications = {};
+        }
+
+        res.json({ rawText, medications });
     } catch (err) {
         if (req.file?.path) {
             fs.unlink(req.file.path, () => {});
