@@ -1025,7 +1025,7 @@ app.post('/api/prescription/scan', upload.single('prescription'), async (req, re
         }
 
         // 2. Extract structured medication details from the text
-        // Use Gemini again for structured extraction
+        // Use Gemini again for structured extractionn
         const geminiReqMedications = {
             contents: [
                 {
